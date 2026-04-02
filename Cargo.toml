@@ -3,6 +3,11 @@ name = "rippy"
 version = "0.1.0"
 edition = "2021"
 description = "A macOS clipboard history manager CLI"
+license = "MIT"
+repository = "https://github.com/brianchuang/rippy"
+homepage = "https://github.com/brianchuang/rippy"
+keywords = ["clipboard", "macos", "tui", "vim"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
