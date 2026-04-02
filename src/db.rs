@@ -1,12 +1,14 @@
 use chrono::{DateTime, Local, TimeZone};
 use rusqlite::{params, Connection, Result, Row};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ClipEntry {
     pub id: i64,
     pub content: String,
+    #[serde(skip)]
     pub hash: String,
     pub timestamp: DateTime<Local>,
     pub app_name: Option<String>,
@@ -120,6 +122,102 @@ impl Store {
 
     pub fn all(&self) -> Result<Vec<ClipEntry>> {
         self.recent(10000)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn temp_store() -> Store {
+        Store::open(Path::new(":memory:")).unwrap()
+    }
+
+    #[test]
+    fn serialize_clip_entry_excludes_hash() {
+        let entry = ClipEntry {
+            id: 1,
+            content: "hello world".to_string(),
+            hash: "abc123".to_string(),
+            timestamp: Local.timestamp_opt(1700000000, 0).unwrap(),
+            app_name: Some("Terminal".to_string()),
+        };
+        let json: serde_json::Value = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["id"], 1);
+        assert_eq!(json["content"], "hello world");
+        assert_eq!(json["app_name"], "Terminal");
+        assert!(json.get("hash").is_none(), "hash should be excluded from JSON");
+        assert!(json["timestamp"].as_str().unwrap().contains("2023-11-14"));
+    }
+
+    #[test]
+    fn serialize_clip_entry_null_app_name() {
+        let entry = ClipEntry {
+            id: 2,
+            content: "test".to_string(),
+            hash: "def456".to_string(),
+            timestamp: Local.timestamp_opt(1700000000, 0).unwrap(),
+            app_name: None,
+        };
+        let json: serde_json::Value = serde_json::to_value(&entry).unwrap();
+        assert!(json["app_name"].is_null());
+    }
+
+    #[test]
+    fn insert_and_retrieve() {
+        let store = temp_store();
+        let id = store.insert("clipboard content", Some("Safari")).unwrap();
+        let entry = store.get(id).unwrap().unwrap();
+        assert_eq!(entry.content, "clipboard content");
+        assert_eq!(entry.app_name.as_deref(), Some("Safari"));
+    }
+
+    #[test]
+    fn insert_deduplicates_by_hash() {
+        let store = temp_store();
+        let id1 = store.insert("same content", None).unwrap();
+        let id2 = store.insert("same content", None).unwrap();
+        assert_eq!(id1, id2, "duplicate content should return same ID");
+        assert_eq!(store.recent(100).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn search_returns_matching_entries() {
+        let store = temp_store();
+        store.insert("rust programming", None).unwrap();
+        store.insert("go programming", None).unwrap();
+        store.insert("grocery list", None).unwrap();
+
+        let results = store.search("programming", 10).unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn recent_respects_limit() {
+        let store = temp_store();
+        for i in 0..10 {
+            store.insert(&format!("entry {i}"), None).unwrap();
+        }
+        assert_eq!(store.recent(3).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn delete_removes_entry() {
+        let store = temp_store();
+        let id = store.insert("to delete", None).unwrap();
+        assert!(store.delete(id).unwrap());
+        assert!(store.get(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn clear_removes_all() {
+        let store = temp_store();
+        store.insert("one", None).unwrap();
+        store.insert("two", None).unwrap();
+        let count = store.clear().unwrap();
+        assert_eq!(count, 2);
+        assert!(store.recent(100).unwrap().is_empty());
     }
 }
 

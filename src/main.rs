@@ -25,6 +25,9 @@ enum Commands {
         /// Number of entries to show
         #[arg(short, long, default_value = "20")]
         count: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Search clipboard history
     Search {
@@ -33,6 +36,9 @@ enum Commands {
         /// Max results
         #[arg(short, long, default_value = "20")]
         count: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Copy a history entry back to clipboard by ID
     Copy {
@@ -102,8 +108,8 @@ fn run() -> Result {
 
     match cli.command {
         None => tui::run(&db_path())?,
-        Some(Commands::List { count }) => print!("{}", cmd_list(count)?),
-        Some(Commands::Search { query, count }) => print!("{}", cmd_search(&query, count)?),
+        Some(Commands::List { count, json }) => print!("{}", cmd_list(count, json)?),
+        Some(Commands::Search { query, count, json }) => print!("{}", cmd_search(&query, count, json)?),
         Some(Commands::Copy { id }) => println!("{}", cmd_copy(id)?),
         Some(Commands::Clear) => println!("{}", cmd_clear()?),
         Some(Commands::Hotkey { action }) => cmd_hotkey(action)?,
@@ -114,15 +120,23 @@ fn run() -> Result {
     Ok(())
 }
 
-fn cmd_list(count: usize) -> Result<String> {
+fn cmd_list(count: usize, json: bool) -> Result<String> {
     with_store(|store| store.recent(count))
-        .map(|entries| format_entries(&entries, "No clipboard history yet. Run `rippy` to start."))
+        .map(|entries| if json {
+            format_entries_json(&entries)
+        } else {
+            format_entries(&entries, "No clipboard history yet. Run `rippy` to start.")
+        })
 }
 
-fn cmd_search(query: &str, count: usize) -> Result<String> {
+fn cmd_search(query: &str, count: usize, json: bool) -> Result<String> {
     let q = query.to_string();
     with_store(move |store| store.search(&q, count))
-        .map(|entries| format_entries(&entries, "No matches found."))
+        .map(|entries| if json {
+            format_entries_json(&entries)
+        } else {
+            format_entries(&entries, "No matches found.")
+        })
 }
 
 fn cmd_copy(id: i64) -> Result<String> {
@@ -335,6 +349,10 @@ fn plist_path() -> PathBuf {
         .join("Library/LaunchAgents/com.rippy.watcher.plist")
 }
 
+fn format_entries_json(entries: &[db::ClipEntry]) -> String {
+    serde_json::to_string_pretty(entries).unwrap() + "\n"
+}
+
 fn format_entries(entries: &[db::ClipEntry], empty_msg: &str) -> String {
     if entries.is_empty() {
         return format!("{empty_msg}\n");
@@ -355,5 +373,76 @@ fn truncate(s: &str, max: usize) -> String {
         format!("{line}…")
     } else {
         line.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn make_entry(id: i64, content: &str) -> db::ClipEntry {
+        db::ClipEntry {
+            id,
+            content: content.to_string(),
+            hash: "unused".to_string(),
+            timestamp: chrono::Local.timestamp_opt(1700000000, 0).unwrap(),
+            app_name: None,
+        }
+    }
+
+    #[test]
+    fn format_entries_json_empty() {
+        let output = format_entries_json(&[]);
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed, serde_json::json!([]));
+    }
+
+    #[test]
+    fn format_entries_json_roundtrip() {
+        let entries = vec![
+            make_entry(1, "first"),
+            make_entry(2, "second"),
+        ];
+        let output = format_entries_json(&entries);
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0]["id"], 1);
+        assert_eq!(parsed[0]["content"], "first");
+        assert_eq!(parsed[1]["id"], 2);
+        assert!(parsed[0].get("hash").is_none());
+    }
+
+    #[test]
+    fn format_entries_plain_empty_shows_message() {
+        let output = format_entries(&[], "No entries.");
+        assert_eq!(output, "No entries.\n");
+    }
+
+    #[test]
+    fn format_entries_plain_shows_id_and_content() {
+        let entries = vec![make_entry(42, "hello world")];
+        let output = format_entries(&entries, "empty");
+        assert!(output.contains("42"));
+        assert!(output.contains("hello world"));
+    }
+
+    #[test]
+    fn truncate_short_string() {
+        assert_eq!(truncate("short", 80), "short");
+    }
+
+    #[test]
+    fn truncate_long_string() {
+        let long = "a".repeat(100);
+        let result = truncate(&long, 10);
+        assert!(result.ends_with('…'));
+        assert!(result.len() <= 14); // 10 bytes + multibyte ellipsis
+    }
+
+    #[test]
+    fn truncate_multiline() {
+        let result = truncate("first line\nsecond line", 80);
+        assert_eq!(result, "first line…");
     }
 }
