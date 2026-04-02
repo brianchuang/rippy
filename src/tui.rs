@@ -14,14 +14,27 @@ use std::time::Instant;
 
 // --- Actions (Elm-style message type) ---
 
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Normal,
+    Insert,
+}
+
 enum Action {
     Quit,
     CopyAndQuit,
     MoveUp,
     MoveDown,
+    MoveToTop,
+    MoveToBottom,
+    HalfPageUp,
+    HalfPageDown,
     DeleteSelected,
+    EnterInsert,
+    ExitInsert,
     TypeChar(char),
     Backspace,
+    ClearSearch,
     Noop,
 }
 
@@ -36,6 +49,9 @@ struct App {
     scroll_offset: usize,
     should_quit: bool,
     copied_id: Option<i64>,
+    mode: Mode,
+    pending_key: Option<char>,
+    list_height: usize,
 }
 
 impl App {
@@ -51,6 +67,9 @@ impl App {
             scroll_offset: 0,
             should_quit: false,
             copied_id: None,
+            mode: Mode::Normal,
+            pending_key: None,
+            list_height: 0,
         }
     }
 
@@ -96,18 +115,59 @@ impl App {
 
 // --- Pure functions ---
 
-fn handle_key(key: KeyEvent) -> Action {
+fn handle_key(key: KeyEvent, mode: Mode, pending: &mut Option<char>) -> Action {
+    // Ctrl+C always quits
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return Action::Quit;
+    }
+
+    match mode {
+        Mode::Normal => handle_normal_key(key, pending),
+        Mode::Insert => handle_insert_key(key),
+    }
+}
+
+fn handle_normal_key(key: KeyEvent, pending: &mut Option<char>) -> Action {
+    // Check for two-key combos first
+    if let Some(first) = pending.take() {
+        return match (first, key.code) {
+            ('g', KeyCode::Char('g')) => Action::MoveToTop,
+            ('d', KeyCode::Char('d')) => Action::DeleteSelected,
+            _ => Action::Noop, // invalid combo, discard
+        };
+    }
+
+    // Check Ctrl modifiers first since they overlap with bare keys
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return match key.code {
+            KeyCode::Char('u') => Action::HalfPageUp,
+            KeyCode::Char('d') => Action::HalfPageDown,
+            _ => Action::Noop,
+        };
+    }
+
     match key.code {
-        KeyCode::Esc => Action::Quit,
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
-        KeyCode::Up => Action::MoveUp,
-        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::MoveUp,
-        KeyCode::Down => Action::MoveDown,
-        KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::MoveDown,
+        KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
+        KeyCode::Char('j') | KeyCode::Down => Action::MoveDown,
+        KeyCode::Char('k') | KeyCode::Up => Action::MoveUp,
+        KeyCode::Char('G') => Action::MoveToBottom,
+        KeyCode::Char('g') => { *pending = Some('g'); Action::Noop }
+        KeyCode::Char('d') => { *pending = Some('d'); Action::Noop }
         KeyCode::Enter => Action::CopyAndQuit,
-        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::DeleteSelected,
+        KeyCode::Char('/') | KeyCode::Char('i') => Action::EnterInsert,
+        _ => Action::Noop,
+    }
+}
+
+fn handle_insert_key(key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Esc => Action::ExitInsert,
+        KeyCode::Enter => Action::CopyAndQuit,
         KeyCode::Backspace => Action::Backspace,
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::ClearSearch,
         KeyCode::Char(c) => Action::TypeChar(c),
+        KeyCode::Up => Action::MoveUp,
+        KeyCode::Down => Action::MoveDown,
         _ => Action::Noop,
     }
 }
@@ -131,12 +191,37 @@ fn apply_action(app: &mut App, action: Action) {
                 app.selected += 1;
             }
         }
+        Action::MoveToTop => {
+            app.selected = 0;
+        }
+        Action::MoveToBottom => {
+            if !app.filtered.is_empty() {
+                app.selected = app.filtered.len() - 1;
+            }
+        }
+        Action::HalfPageUp => {
+            let half = app.list_height / 2;
+            app.selected = app.selected.saturating_sub(half.max(1));
+        }
+        Action::HalfPageDown => {
+            let half = app.list_height / 2;
+            if !app.filtered.is_empty() {
+                app.selected = (app.selected + half.max(1)).min(app.filtered.len() - 1);
+            }
+        }
         Action::DeleteSelected => {
             if let Some(entry) = app.selected_entry() {
                 let id = entry.id;
                 app.store.delete(id).ok();
                 app.refresh();
             }
+        }
+        Action::EnterInsert => {
+            app.mode = Mode::Insert;
+        }
+        Action::ExitInsert => {
+            app.mode = Mode::Normal;
+            app.pending_key = None;
         }
         Action::TypeChar(c) => {
             app.query.push(c);
@@ -145,6 +230,11 @@ fn apply_action(app: &mut App, action: Action) {
         }
         Action::Backspace => {
             app.query.pop();
+            app.refilter();
+            app.reset_selection();
+        }
+        Action::ClearSearch => {
+            app.query.clear();
             app.refilter();
             app.reset_selection();
         }
@@ -212,7 +302,8 @@ fn event_loop(
                     continue;
                 }
                 app.copied_id = None;
-                apply_action(app, handle_key(key));
+                let action = handle_key(key, app.mode, &mut app.pending_key);
+                apply_action(app, action);
             }
         }
 
@@ -234,9 +325,10 @@ fn render(f: &mut Frame, app: &mut App) {
         ])
         .split(f.area());
 
-    f.render_widget(render_search_bar(&app.query), chunks[0]);
+    f.render_widget(render_search_bar(&app.query, app.mode), chunks[0]);
 
     let list_height = chunks[1].height as usize;
+    app.list_height = list_height;
     adjust_scroll(app, list_height);
     f.render_widget(
         render_clip_list(&app.entries, &app.filtered, app.selected, app.scroll_offset, list_height, app.copied_id),
@@ -244,16 +336,35 @@ fn render(f: &mut Frame, app: &mut App) {
     );
 
     f.render_widget(
-        render_status_bar(app.filtered.len(), app.entries.len(), app.copied_id),
+        render_status_bar(app.filtered.len(), app.entries.len(), app.copied_id, app.mode),
         chunks[2],
     );
 }
 
-fn render_search_bar(query: &str) -> Paragraph<'static> {
-    let (text, style) = if query.is_empty() {
-        (" Type to search…".to_string(), Style::default().fg(Color::DarkGray))
-    } else {
-        (format!(" {query}"), Style::default().fg(Color::White))
+fn render_search_bar(query: &str, mode: Mode) -> Paragraph<'static> {
+    let border_color = match mode {
+        Mode::Insert => Color::Green,
+        Mode::Normal => Color::Cyan,
+    };
+
+    let (text, style) = match mode {
+        Mode::Insert if query.is_empty() => {
+            (" Type to search…".to_string(), Style::default().fg(Color::DarkGray))
+        }
+        Mode::Insert => {
+            (format!(" {query}█"), Style::default().fg(Color::White))
+        }
+        Mode::Normal if query.is_empty() => {
+            (" Press / to search".to_string(), Style::default().fg(Color::DarkGray))
+        }
+        Mode::Normal => {
+            (format!(" {query}"), Style::default().fg(Color::White))
+        }
+    };
+
+    let mode_label = match mode {
+        Mode::Normal => " rippy [NORMAL] ",
+        Mode::Insert => " rippy [INSERT] ",
     };
 
     Paragraph::new(text)
@@ -261,8 +372,8 @@ fn render_search_bar(query: &str) -> Paragraph<'static> {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
-                .title(" rippy "),
+                .border_style(Style::default().fg(border_color))
+                .title(mode_label),
         )
 }
 
@@ -303,14 +414,15 @@ fn render_list_item(entry: &ClipEntry, is_selected: bool, copied_id: Option<i64>
     ]))
 }
 
-fn render_status_bar(count: usize, total: usize, copied_id: Option<i64>) -> Paragraph<'static> {
+fn render_status_bar(count: usize, total: usize, copied_id: Option<i64>, mode: Mode) -> Paragraph<'static> {
     let (text, style) = if copied_id.is_some() {
         (" Copied! ".to_string(), Style::default().bg(Color::Green).fg(Color::Black))
     } else {
-        (
-            format!(" {count}/{total} │ ↑↓ navigate │ Enter copy │ Ctrl+D delete │ Esc quit"),
-            Style::default().bg(Color::DarkGray).fg(Color::White),
-        )
+        let help = match mode {
+            Mode::Normal => format!(" {count}/{total} │ j/k move │ Enter copy │ dd delete │ / search │ q quit"),
+            Mode::Insert => format!(" {count}/{total} │ type to filter │ Enter copy │ Esc normal mode"),
+        };
+        (help, Style::default().bg(Color::DarkGray).fg(Color::White))
     };
 
     Paragraph::new(text).style(style)
