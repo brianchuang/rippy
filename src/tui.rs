@@ -56,20 +56,26 @@ impl App {
 
     fn refresh(&mut self) {
         self.entries = self.store.all().unwrap_or_default();
+        self.refilter();
+    }
+
+    fn refilter(&mut self) {
         self.filtered = compute_filtered(&self.entries, &self.query);
-        // Clamp selection to stay in bounds without resetting position
+        self.clamp_selection();
+    }
+
+    fn reset_selection(&mut self) {
+        self.selected = 0;
+        self.scroll_offset = 0;
+    }
+
+    fn clamp_selection(&mut self) {
         if self.filtered.is_empty() {
             self.selected = 0;
             self.scroll_offset = 0;
         } else {
             self.selected = self.selected.min(self.filtered.len() - 1);
         }
-    }
-
-    fn refilter(&mut self) {
-        self.filtered = compute_filtered(&self.entries, &self.query);
-        self.selected = 0;
-        self.scroll_offset = 0;
     }
 
     fn selected_entry(&self) -> Option<&ClipEntry> {
@@ -124,10 +130,12 @@ fn apply_action(app: &mut App, action: Action) {
         Action::TypeChar(c) => {
             app.query.push(c);
             app.refilter();
+            app.reset_selection();
         }
         Action::Backspace => {
             app.query.pop();
             app.refilter();
+            app.reset_selection();
         }
     }
 }
