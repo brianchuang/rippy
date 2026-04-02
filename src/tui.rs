@@ -55,8 +55,19 @@ impl App {
     }
 
     fn refresh(&mut self) {
+        let prev_id = self.selected_entry().map(|e| e.id);
         self.entries = self.store.all().unwrap_or_default();
-        self.refilter();
+        self.filtered = compute_filtered(&self.entries, &self.query);
+        // Restore selection to the same entry by ID, falling back to clamp
+        if let Some(id) = prev_id {
+            if let Some(pos) = self.filtered.iter().position(|&i| self.entries[i].id == id) {
+                self.selected = pos;
+            } else {
+                self.clamp_selection();
+            }
+        } else {
+            self.clamp_selection();
+        }
     }
 
     fn refilter(&mut self) {
