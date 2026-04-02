@@ -1,56 +1,41 @@
-use std::process::Command;
+use objc2_app_kit::NSPasteboard;
+use objc2_app_kit::NSPasteboardTypeString;
+use objc2_foundation::NSString;
 
-/// Read the current clipboard contents and the change count.
-/// Returns (content, change_count).
-pub fn get_clipboard() -> (Option<String>, i64) {
-    // Use pbpaste for content
-    let content = Command::new("pbpaste")
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                String::from_utf8(o.stdout).ok()
-            } else {
-                None
-            }
-        })
-        .filter(|s| !s.is_empty());
-
-    // Use osascript to get the change count from NSPasteboard
-    let change_count = Command::new("osascript")
-        .args([
-            "-e",
-            "use framework \"AppKit\"",
-            "-e",
-            "set pb to current application's NSPasteboard's generalPasteboard()",
-            "-e",
-            "pb's changeCount() as integer",
-        ])
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                String::from_utf8(o.stdout)
-                    .ok()
-                    .and_then(|s| s.trim().parse::<i64>().ok())
-            } else {
-                None
-            }
-        })
-        .unwrap_or(0);
-
-    (content, change_count)
+pub trait Clipboard {
+    fn read(&self) -> (Option<String>, i64);
+    fn write(&self, content: &str);
 }
 
-/// Set the clipboard to the given string.
-pub fn set_clipboard(content: &str) {
-    let mut child = Command::new("pbcopy")
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .expect("Failed to run pbcopy");
-    use std::io::Write;
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin.write_all(content.as_bytes()).ok();
+pub struct SystemClipboard;
+
+impl Clipboard for SystemClipboard {
+    fn read(&self) -> (Option<String>, i64) {
+        unsafe {
+            let pb = NSPasteboard::generalPasteboard();
+            let count = pb.changeCount() as i64;
+            let content = pb
+                .stringForType(NSPasteboardTypeString)
+                .map(|s| s.to_string())
+                .filter(|s| !s.is_empty());
+            (content, count)
+        }
     }
-    child.wait().ok();
+
+    fn write(&self, content: &str) {
+        unsafe {
+            let pb = NSPasteboard::generalPasteboard();
+            pb.clearContents();
+            let ns_string = NSString::from_str(content);
+            pb.setString_forType(&ns_string, NSPasteboardTypeString);
+        }
+    }
+}
+
+pub fn get_clipboard() -> (Option<String>, i64) {
+    SystemClipboard.read()
+}
+
+pub fn set_clipboard(content: &str) {
+    SystemClipboard.write(content);
 }

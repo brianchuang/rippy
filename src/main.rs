@@ -1,10 +1,15 @@
 mod clipboard;
+mod config;
 mod db;
-mod daemon;
+mod hotkey;
+mod terminal;
 mod tui;
+mod watcher;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+
+type Result<T = ()> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Parser)]
 #[command(name = "rippy", about = "macOS clipboard history manager")]
@@ -15,12 +20,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the clipboard monitoring daemon
-    Daemon {
-        /// Run in foreground instead of daemonizing
-        #[arg(short, long)]
-        foreground: bool,
-    },
     /// List recent clipboard entries
     List {
         /// Number of entries to show
@@ -35,150 +34,263 @@ enum Commands {
         #[arg(short, long, default_value = "20")]
         count: usize,
     },
-    /// Copy a history entry back to the clipboard by ID
+    /// Copy a history entry back to clipboard by ID
     Copy {
         /// Entry ID
         id: i64,
     },
     /// Clear all clipboard history
     Clear,
-    /// Show daemon status
-    Status,
-    /// Stop the running daemon
-    Stop,
+    /// Install as a launchd service for 24/7 clipboard monitoring
+    Install,
+    /// Uninstall the launchd service
+    Uninstall,
+    /// Configure the global hotkey
+    Hotkey {
+        #[command(subcommand)]
+        action: HotkeyAction,
+    },
+    /// Watch clipboard (used internally by launchd)
+    #[command(hide = true)]
+    Watch,
+}
+
+#[derive(Subcommand)]
+enum HotkeyAction {
+    /// Show current hotkey configuration
+    Show,
+    /// Set the hotkey
+    Set {
+        /// Key name (e.g. v, c, space, f1)
+        #[arg(long)]
+        key: Option<String>,
+        /// Comma-separated modifiers (e.g. cmd,shift)
+        #[arg(long)]
+        modifiers: Option<String>,
+        /// Terminal app: auto, Terminal, iTerm2, Alacritty, WezTerm
+        #[arg(long)]
+        terminal: Option<String>,
+    },
+    /// Test the hotkey listener (runs in foreground)
+    Test,
 }
 
 fn data_dir() -> PathBuf {
-    let mut dir = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
-    dir.push("rippy");
+    let dir = dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("rippy");
     std::fs::create_dir_all(&dir).ok();
     dir
 }
 
-fn db_path() -> PathBuf {
-    data_dir().join("history.db")
-}
+fn db_path() -> PathBuf { data_dir().join("history.db") }
 
-fn pid_path() -> PathBuf {
-    data_dir().join("rippy.pid")
+fn with_store<T>(f: impl FnOnce(&db::Store) -> std::result::Result<T, rusqlite::Error>) -> Result<T> {
+    let store = db::Store::open(&db_path())?;
+    Ok(f(&store)?)
 }
 
 fn main() {
+    if let Err(e) = run() {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result {
     let cli = Cli::parse();
 
     match cli.command {
-        None => {
-            if let Err(e) = tui::run(&db_path()) {
-                eprintln!("Error: {e}");
-                std::process::exit(1);
-            }
-        }
-        Some(Commands::Daemon { foreground }) => {
-            daemon::run(foreground, &db_path(), &pid_path());
-        }
-        Some(Commands::List { count }) => {
-            cmd_list(count);
-        }
-        Some(Commands::Search { query, count }) => {
-            cmd_search(&query, count);
-        }
-        Some(Commands::Copy { id }) => {
-            cmd_copy(id);
-        }
-        Some(Commands::Clear) => {
-            cmd_clear();
-        }
-        Some(Commands::Status) => {
-            cmd_status();
-        }
-        Some(Commands::Stop) => {
-            cmd_stop();
-        }
+        None => tui::run(&db_path())?,
+        Some(Commands::List { count }) => print!("{}", cmd_list(count)?),
+        Some(Commands::Search { query, count }) => print!("{}", cmd_search(&query, count)?),
+        Some(Commands::Copy { id }) => println!("{}", cmd_copy(id)?),
+        Some(Commands::Clear) => println!("{}", cmd_clear()?),
+        Some(Commands::Hotkey { action }) => cmd_hotkey(action)?,
+        Some(Commands::Install) => println!("{}", cmd_install()?),
+        Some(Commands::Uninstall) => println!("{}", cmd_uninstall()?),
+        Some(Commands::Watch) => cmd_watch()?,
     }
+    Ok(())
 }
 
-fn cmd_list(count: usize) {
-    let store = db::Store::open(&db_path()).expect("Failed to open database");
-    let entries = store.recent(count).expect("Failed to read entries");
-    if entries.is_empty() {
-        println!("No clipboard history. Start the daemon with: rippy daemon");
-        return;
-    }
-    print_entries(&entries);
+fn cmd_list(count: usize) -> Result<String> {
+    with_store(|store| store.recent(count))
+        .map(|entries| format_entries(&entries, "No clipboard history yet. Run `rippy` to start."))
 }
 
-fn cmd_search(query: &str, count: usize) {
-    let store = db::Store::open(&db_path()).expect("Failed to open database");
-    let entries = store.search(query, count).expect("Failed to search");
-    if entries.is_empty() {
-        println!("No matches found.");
-        return;
-    }
-    print_entries(&entries);
+fn cmd_search(query: &str, count: usize) -> Result<String> {
+    let q = query.to_string();
+    with_store(move |store| store.search(&q, count))
+        .map(|entries| format_entries(&entries, "No matches found."))
 }
 
-fn cmd_copy(id: i64) {
-    let store = db::Store::open(&db_path()).expect("Failed to open database");
-    match store.get(id) {
-        Ok(Some(entry)) => {
+fn cmd_copy(id: i64) -> Result<String> {
+    with_store(|store| store.get(id))?
+        .map(|entry| {
             clipboard::set_clipboard(&entry.content);
-            let preview = truncate(&entry.content, 60);
-            println!("Copied to clipboard: {preview}");
-        }
-        Ok(None) => {
-            eprintln!("Entry {id} not found.");
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("Error: {e}");
-            std::process::exit(1);
-        }
+            format!("Copied to clipboard: {}", truncate(&entry.content, 60))
+        })
+        .ok_or_else(|| format!("Entry {id} not found.").into())
+}
+
+fn cmd_clear() -> Result<String> {
+    with_store(|store| store.clear())
+        .map(|count| format!("Cleared {count} entries."))
+}
+
+fn cmd_install() -> Result<String> {
+    let plist_path = plist_path();
+    let rippy_bin = std::env::current_exe()?
+        .canonicalize()?
+        .to_string_lossy()
+        .to_string();
+
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.rippy.watcher</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{rippy_bin}</string>
+        <string>watch</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+</dict>
+</plist>"#
+    );
+
+    std::fs::write(&plist_path, plist)?;
+
+    std::process::Command::new("launchctl")
+        .args(["load", &plist_path.to_string_lossy()])
+        .status()?;
+
+    let mut msg = format!("Installed launchd service.\nClipboard is now monitored 24/7, even when rippy isn't open.\nPlist: {}", plist_path.display());
+    msg.push_str(&format!(
+        "\n\nGlobal hotkey ({}) is active. To change it: rippy hotkey set --key <key> --modifiers <mods>",
+        config::format_hotkey(&config::Config::load(&data_dir()).hotkey)
+    ));
+    msg.push_str("\n\nNote: The hotkey requires Accessibility permission.");
+    msg.push_str("\n  System Settings > Privacy & Security > Accessibility");
+    Ok(msg)
+}
+
+fn cmd_uninstall() -> Result<String> {
+    let plist_path = plist_path();
+
+    if plist_path.exists() {
+        std::process::Command::new("launchctl")
+            .args(["unload", &plist_path.to_string_lossy()])
+            .status()?;
+        std::fs::remove_file(&plist_path)?;
+        Ok("Uninstalled launchd service. Clipboard monitoring stopped.".to_string())
+    } else {
+        Ok("No launchd service installed.".to_string())
     }
 }
 
-fn cmd_clear() {
-    let store = db::Store::open(&db_path()).expect("Failed to open database");
-    let count = store.clear().expect("Failed to clear history");
-    println!("Cleared {count} entries.");
-}
-
-fn cmd_status() {
-    match daemon::read_pid(&pid_path()) {
-        Some(pid) => {
-            if daemon::is_running(pid) {
-                println!("Daemon is running (PID {pid})");
-            } else {
-                println!("Daemon is not running (stale PID file)");
-            }
+fn cmd_hotkey(action: HotkeyAction) -> Result {
+    let dir = data_dir();
+    match action {
+        HotkeyAction::Show => {
+            let cfg = config::Config::load(&dir);
+            println!("Hotkey:   {}", config::format_hotkey(&cfg.hotkey));
+            println!("Terminal: {}", cfg.terminal.app);
+            println!("\nConfig file: {}", config::Config::path(&dir).display());
         }
-        None => println!("Daemon is not running"),
-    }
-}
-
-fn cmd_stop() {
-    match daemon::read_pid(&pid_path()) {
-        Some(pid) => {
-            if daemon::is_running(pid) {
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGTERM);
+        HotkeyAction::Set { key, modifiers, terminal } => {
+            let mut cfg = config::Config::load(&dir);
+            if let Some(k) = &key {
+                if config::keycode_for(k).is_none() {
+                    return Err(format!("Unknown key: '{k}'. Use a letter, number, or f1-f12.").into());
                 }
-                println!("Sent stop signal to daemon (PID {pid})");
-                std::fs::remove_file(pid_path()).ok();
-            } else {
-                println!("Daemon is not running (cleaning stale PID file)");
-                std::fs::remove_file(pid_path()).ok();
+                cfg.hotkey.key = k.clone();
             }
+            if let Some(m) = &modifiers {
+                let mods: Vec<String> = m.split(',').map(|s| s.trim().to_lowercase()).collect();
+                for name in &mods {
+                    if config::modifier_flag(name).is_none() {
+                        return Err(format!("Unknown modifier: '{name}'. Use cmd, shift, ctrl, or alt.").into());
+                    }
+                }
+                cfg.hotkey.modifiers = mods;
+            }
+            if let Some(t) = terminal {
+                cfg.terminal.app = t;
+            }
+            cfg.save(&dir)?;
+            println!("Updated hotkey: {}", config::format_hotkey(&cfg.hotkey));
+            println!("Terminal: {}", cfg.terminal.app);
+            println!("\nRestart the service for changes to take effect:");
+            println!("  rippy uninstall && rippy install");
         }
-        None => println!("Daemon is not running"),
+        HotkeyAction::Test => {
+            let cfg = config::Config::load(&dir);
+            if !hotkey::check_accessibility() {
+                eprintln!("Warning: Accessibility permission not granted.");
+                eprintln!("  System Settings > Privacy & Security > Accessibility");
+                eprintln!();
+            }
+            println!("Listening for {}... Press Ctrl+C to stop.", config::format_hotkey(&cfg.hotkey));
+            use std::sync::atomic::AtomicBool;
+            use std::sync::Arc;
+            let running = Arc::new(AtomicBool::new(true));
+            signal_hook::flag::register(signal_hook::consts::SIGINT, running.clone()).ok();
+            hotkey::install_and_run(&cfg, running);
+        }
     }
+    Ok(())
 }
 
-fn print_entries(entries: &[db::ClipEntry]) {
-    for entry in entries {
-        let preview = truncate(&entry.content, 80);
-        let time = entry.timestamp.format("%Y-%m-%d %H:%M:%S");
-        println!("{:>5} │ {} │ {}", entry.id, time, preview);
+fn cmd_watch() -> Result {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let running = Arc::new(AtomicBool::new(true));
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, running.clone()).ok();
+    signal_hook::flag::register(signal_hook::consts::SIGINT, running.clone()).ok();
+
+    let w = watcher::Watcher::spawn(&db_path());
+    let cfg = config::Config::load(&data_dir());
+
+    if !hotkey::check_accessibility() {
+        eprintln!("Hotkey disabled: Accessibility permission not granted.");
+        eprintln!("  System Settings > Privacy & Security > Accessibility");
+        eprintln!("Falling back to clipboard watching only.");
+        while running.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    } else {
+        hotkey::install_and_run(&cfg, running);
     }
+
+    w.stop();
+    Ok(())
+}
+
+fn plist_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("~"))
+        .join("Library/LaunchAgents/com.rippy.watcher.plist")
+}
+
+fn format_entries(entries: &[db::ClipEntry], empty_msg: &str) -> String {
+    if entries.is_empty() {
+        return format!("{empty_msg}\n");
+    }
+    entries
+        .iter()
+        .map(|e| format!("{:>5} │ {} │ {}", e.id, e.timestamp.format("%Y-%m-%d %H:%M:%S"), truncate(&e.content, 80)))
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
 }
 
 fn truncate(s: &str, max: usize) -> String {

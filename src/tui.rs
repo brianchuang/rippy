@@ -1,6 +1,7 @@
 use crate::clipboard;
 use crate::db::{ClipEntry, Store};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crate::watcher::Watcher;
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
 use fuzzy_matcher::skim::SkimMatcherV2;
@@ -9,11 +10,27 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 use std::io::stdout;
 use std::path::Path;
+use std::time::Instant;
+
+// --- Actions (Elm-style message type) ---
+
+enum Action {
+    Quit,
+    CopyAndQuit,
+    MoveUp,
+    MoveDown,
+    DeleteSelected,
+    TypeChar(char),
+    Backspace,
+    Noop,
+}
+
+// --- State ---
 
 struct App {
     store: Store,
     entries: Vec<ClipEntry>,
-    filtered: Vec<usize>, // indices into entries
+    filtered: Vec<usize>,
     query: String,
     selected: usize,
     scroll_offset: usize,
@@ -24,7 +41,7 @@ struct App {
 impl App {
     fn new(store: Store) -> Self {
         let entries = store.all().unwrap_or_default();
-        let filtered: Vec<usize> = (0..entries.len()).collect();
+        let filtered = compute_filtered(&entries, "");
         App {
             store,
             entries,
@@ -39,66 +56,106 @@ impl App {
 
     fn refresh(&mut self) {
         self.entries = self.store.all().unwrap_or_default();
-        self.apply_filter();
+        self.filtered = compute_filtered(&self.entries, &self.query);
+        // Clamp selection to stay in bounds without resetting position
+        if self.filtered.is_empty() {
+            self.selected = 0;
+            self.scroll_offset = 0;
+        } else {
+            self.selected = self.selected.min(self.filtered.len() - 1);
+        }
     }
 
-    fn apply_filter(&mut self) {
-        if self.query.is_empty() {
-            self.filtered = (0..self.entries.len()).collect();
-        } else {
-            let matcher = SkimMatcherV2::default();
-            let mut scored: Vec<(usize, i64)> = self
-                .entries
-                .iter()
-                .enumerate()
-                .filter_map(|(i, entry)| {
-                    matcher
-                        .fuzzy_match(&entry.content, &self.query)
-                        .map(|score| (i, score))
-                })
-                .collect();
-            scored.sort_by(|a, b| b.1.cmp(&a.1));
-            self.filtered = scored.into_iter().map(|(i, _)| i).collect();
-        }
+    fn refilter(&mut self) {
+        self.filtered = compute_filtered(&self.entries, &self.query);
         self.selected = 0;
         self.scroll_offset = 0;
     }
 
     fn selected_entry(&self) -> Option<&ClipEntry> {
-        self.filtered
-            .get(self.selected)
-            .map(|&i| &self.entries[i])
+        self.filtered.get(self.selected).map(|&i| &self.entries[i])
     }
+}
 
-    fn copy_selected(&mut self) {
-        if let Some(entry) = self.selected_entry() {
-            clipboard::set_clipboard(&entry.content);
-            self.copied_id = Some(entry.id);
+// --- Pure functions ---
+
+fn handle_key(key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Esc => Action::Quit,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
+        KeyCode::Up => Action::MoveUp,
+        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::MoveUp,
+        KeyCode::Down => Action::MoveDown,
+        KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::MoveDown,
+        KeyCode::Enter => Action::CopyAndQuit,
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::DeleteSelected,
+        KeyCode::Backspace => Action::Backspace,
+        KeyCode::Char(c) => Action::TypeChar(c),
+        _ => Action::Noop,
+    }
+}
+
+fn apply_action(app: &mut App, action: Action) {
+    match action {
+        Action::Noop => {}
+        Action::Quit => app.should_quit = true,
+        Action::CopyAndQuit => {
+            if let Some(entry) = app.selected_entry() {
+                clipboard::set_clipboard(&entry.content);
+                app.copied_id = Some(entry.id);
+            }
+            app.should_quit = true;
         }
-    }
-
-    fn delete_selected(&mut self) {
-        if let Some(entry) = self.selected_entry() {
-            let id = entry.id;
-            self.store.delete(id).ok();
-            self.refresh();
+        Action::MoveUp => {
+            app.selected = app.selected.saturating_sub(1);
         }
-    }
-
-    fn move_up(&mut self) {
-        if self.selected > 0 {
-            self.selected -= 1;
+        Action::MoveDown => {
+            if app.selected + 1 < app.filtered.len() {
+                app.selected += 1;
+            }
         }
-    }
-
-    fn move_down(&mut self) {
-        if self.selected + 1 < self.filtered.len() {
-            self.selected += 1;
+        Action::DeleteSelected => {
+            if let Some(entry) = app.selected_entry() {
+                let id = entry.id;
+                app.store.delete(id).ok();
+                app.refresh();
+            }
+        }
+        Action::TypeChar(c) => {
+            app.query.push(c);
+            app.refilter();
+        }
+        Action::Backspace => {
+            app.query.pop();
+            app.refilter();
         }
     }
 }
 
+fn compute_filtered(entries: &[ClipEntry], query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return (0..entries.len()).collect();
+    }
+
+    let matcher = SkimMatcherV2::default();
+    let mut scored: Vec<(usize, i64)> = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(i, entry)| {
+            matcher
+                .fuzzy_match(&entry.content, query)
+                .map(|score| (i, score))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    scored.into_iter().map(|(i, _)| i).collect()
+}
+
+// --- Main loop ---
+
 pub fn run(db_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let watcher = Watcher::spawn(db_path);
+
     let store = Store::open(db_path)?;
     let mut app = App::new(store);
 
@@ -106,8 +163,29 @@ pub fn run(db_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
 
+    let result = event_loop(&mut terminal, &mut app);
+
+    disable_raw_mode()?;
+    stdout().execute(LeaveAlternateScreen)?;
+
+    watcher.stop();
+    result
+}
+
+fn event_loop(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    app: &mut App,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut last_refresh = Instant::now();
+
     loop {
-        terminal.draw(|f| ui(f, &mut app))?;
+        // Refresh entries from DB every second to pick up watcher inserts
+        if last_refresh.elapsed() >= std::time::Duration::from_secs(1) {
+            app.refresh();
+            last_refresh = Instant::now();
+        }
+
+        terminal.draw(|f| render(f, app))?;
 
         if event::poll(std::time::Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
@@ -115,152 +193,115 @@ pub fn run(db_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
                 app.copied_id = None;
-
-                match key.code {
-                    KeyCode::Esc => app.should_quit = true,
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        app.should_quit = true;
-                    }
-                    KeyCode::Up | KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        app.move_up();
-                    }
-                    KeyCode::Down | KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        app.move_down();
-                    }
-                    KeyCode::Enter => {
-                        app.copy_selected();
-                        app.should_quit = true;
-                    }
-                    KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        app.delete_selected();
-                    }
-                    KeyCode::Backspace => {
-                        app.query.pop();
-                        app.apply_filter();
-                    }
-                    KeyCode::Char(c) => {
-                        app.query.push(c);
-                        app.apply_filter();
-                    }
-                    _ => {}
-                }
+                apply_action(app, handle_key(key));
             }
         }
 
         if app.should_quit {
-            break;
+            return Ok(());
         }
     }
-
-    disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?;
-    Ok(())
 }
 
-fn ui(f: &mut Frame, app: &mut App) {
-    let area = f.area();
+// --- Rendering (pure view functions) ---
 
+fn render(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // search bar
-            Constraint::Min(1),   // list
-            Constraint::Length(1), // status bar
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(1),
         ])
-        .split(area);
+        .split(f.area());
 
-    // Search bar
-    let search_text = if app.query.is_empty() {
-        " Type to search…".to_string()
+    f.render_widget(render_search_bar(&app.query), chunks[0]);
+
+    let list_height = chunks[1].height as usize;
+    adjust_scroll(app, list_height);
+    f.render_widget(
+        render_clip_list(&app.entries, &app.filtered, app.selected, app.scroll_offset, list_height, app.copied_id),
+        chunks[1],
+    );
+
+    f.render_widget(
+        render_status_bar(app.filtered.len(), app.entries.len(), app.copied_id),
+        chunks[2],
+    );
+}
+
+fn render_search_bar(query: &str) -> Paragraph<'static> {
+    let (text, style) = if query.is_empty() {
+        (" Type to search…".to_string(), Style::default().fg(Color::DarkGray))
     } else {
-        format!(" {}", app.query)
+        (format!(" {query}"), Style::default().fg(Color::White))
     };
-    let search = Paragraph::new(search_text)
-        .style(if app.query.is_empty() {
-            Style::default().fg(Color::DarkGray)
-        } else {
-            Style::default().fg(Color::White)
-        })
+
+    Paragraph::new(text)
+        .style(style)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan))
                 .title(" rippy "),
-        );
-    f.render_widget(search, chunks[0]);
+        )
+}
 
-    // Clip list
-    let list_height = chunks[1].height as usize;
+fn render_clip_list<'a>(
+    entries: &'a [ClipEntry],
+    filtered: &[usize],
+    selected: usize,
+    scroll_offset: usize,
+    list_height: usize,
+    copied_id: Option<i64>,
+) -> List<'a> {
+    let items: Vec<ListItem> = filtered
+        .iter()
+        .enumerate()
+        .skip(scroll_offset)
+        .take(list_height)
+        .map(|(i, &entry_idx)| render_list_item(&entries[entry_idx], i == selected, copied_id))
+        .collect();
 
-    // Adjust scroll so selected item is visible
+    List::new(items).block(Block::default().borders(Borders::NONE))
+}
+
+fn render_list_item(entry: &ClipEntry, is_selected: bool, copied_id: Option<i64>) -> ListItem<'_> {
+    let preview: String = entry.content.lines().next().unwrap_or("").chars().take(200).collect();
+    let time = entry.timestamp.format("%m/%d %H:%M");
+
+    let style = match (is_selected, Some(entry.id) == copied_id) {
+        (true, _) => Style::default().bg(Color::DarkGray).fg(Color::White),
+        (_, true) => Style::default().fg(Color::Green),
+        _ => Style::default(),
+    };
+
+    let time_color = if is_selected { Color::Cyan } else { Color::DarkGray };
+
+    ListItem::new(Line::from(vec![
+        Span::styled(format!(" {time} "), style.patch(Style::default().fg(time_color))),
+        Span::styled(format!("│ {preview}"), style),
+    ]))
+}
+
+fn render_status_bar(count: usize, total: usize, copied_id: Option<i64>) -> Paragraph<'static> {
+    let (text, style) = if copied_id.is_some() {
+        (" Copied! ".to_string(), Style::default().bg(Color::Green).fg(Color::Black))
+    } else {
+        (
+            format!(" {count}/{total} │ ↑↓ navigate │ Enter copy │ Ctrl+D delete │ Esc quit"),
+            Style::default().bg(Color::DarkGray).fg(Color::White),
+        )
+    };
+
+    Paragraph::new(text).style(style)
+}
+
+fn adjust_scroll(app: &mut App, list_height: usize) {
     if app.selected < app.scroll_offset {
         app.scroll_offset = app.selected;
     }
     if app.selected >= app.scroll_offset + list_height {
         app.scroll_offset = app.selected - list_height + 1;
     }
-
-    let items: Vec<ListItem> = app
-        .filtered
-        .iter()
-        .enumerate()
-        .skip(app.scroll_offset)
-        .take(list_height)
-        .map(|(i, &entry_idx)| {
-            let entry = &app.entries[entry_idx];
-            let preview = entry
-                .content
-                .lines()
-                .next()
-                .unwrap_or("")
-                .chars()
-                .take(200)
-                .collect::<String>();
-
-            let time = entry.timestamp.format("%m/%d %H:%M");
-
-            let style = if i == app.selected {
-                Style::default().bg(Color::DarkGray).fg(Color::White)
-            } else if Some(entry.id) == app.copied_id {
-                Style::default().fg(Color::Green)
-            } else {
-                Style::default()
-            };
-
-            let line = Line::from(vec![
-                Span::styled(
-                    format!(" {time} "),
-                    style.patch(Style::default().fg(if i == app.selected {
-                        Color::Cyan
-                    } else {
-                        Color::DarkGray
-                    })),
-                ),
-                Span::styled(format!("│ {preview}"), style),
-            ]);
-
-            ListItem::new(line)
-        })
-        .collect();
-
-    let list = List::new(items).block(Block::default().borders(Borders::NONE));
-    f.render_widget(list, chunks[1]);
-
-    // Status bar
-    let count = app.filtered.len();
-    let total = app.entries.len();
-    let status_text = if let Some(_) = app.copied_id {
-        " Copied! ".to_string()
-    } else {
-        format!(
-            " {count}/{total} │ ↑↓ navigate │ Enter copy │ Ctrl+D delete │ Esc quit"
-        )
-    };
-    let status_style = if app.copied_id.is_some() {
-        Style::default().bg(Color::Green).fg(Color::Black)
-    } else {
-        Style::default().bg(Color::DarkGray).fg(Color::White)
-    };
-    let status = Paragraph::new(status_text).style(status_style);
-    f.render_widget(status, chunks[2]);
 }

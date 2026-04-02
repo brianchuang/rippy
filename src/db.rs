@@ -1,5 +1,5 @@
 use chrono::{DateTime, Local, TimeZone};
-use rusqlite::{params, Connection, Result};
+use rusqlite::{params, Connection, Result, Row};
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
@@ -14,6 +14,28 @@ pub struct ClipEntry {
 
 pub struct Store {
     conn: Connection,
+}
+
+fn row_to_entry(row: &Row) -> Result<ClipEntry> {
+    Ok(ClipEntry {
+        id: row.get(0)?,
+        content: row.get(1)?,
+        hash: row.get(2)?,
+        timestamp: Local.timestamp_opt(row.get::<_, i64>(3)?, 0).unwrap(),
+        app_name: row.get(4)?,
+    })
+}
+
+fn query_entries(conn: &Connection, sql: &str, params: &[&dyn rusqlite::types::ToSql]) -> Result<Vec<ClipEntry>> {
+    conn.prepare(sql)?
+        .query_map(params, row_to_entry)?
+        .collect()
+}
+
+fn content_hash(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 impl Store {
@@ -34,73 +56,44 @@ impl Store {
         Ok(Store { conn })
     }
 
-    /// Insert a new clip. If the same content already exists, move it to the top
-    /// by updating its timestamp. Returns the entry id.
     pub fn insert(&self, content: &str, app_name: Option<&str>) -> Result<i64> {
         let hash = content_hash(content);
         let now = Local::now().timestamp();
 
-        // Check if this exact content already exists
-        let existing: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT id FROM clips WHERE hash = ?1 LIMIT 1",
-                params![hash],
-                |row| row.get(0),
-            )
+        let existing: Option<i64> = self.conn
+            .query_row("SELECT id FROM clips WHERE hash = ?1 LIMIT 1", params![hash], |row| row.get(0))
             .ok();
 
-        if let Some(id) = existing {
-            // Move to top by updating timestamp
-            self.conn.execute(
-                "UPDATE clips SET timestamp = ?1 WHERE id = ?2",
-                params![now, id],
-            )?;
-            Ok(id)
-        } else {
-            self.conn.execute(
-                "INSERT INTO clips (content, hash, timestamp, app_name) VALUES (?1, ?2, ?3, ?4)",
-                params![content, hash, now, app_name],
-            )?;
-            Ok(self.conn.last_insert_rowid())
+        match existing {
+            Some(id) => {
+                self.conn.execute("UPDATE clips SET timestamp = ?1 WHERE id = ?2", params![now, id])?;
+                Ok(id)
+            }
+            None => {
+                self.conn.execute(
+                    "INSERT INTO clips (content, hash, timestamp, app_name) VALUES (?1, ?2, ?3, ?4)",
+                    params![content, hash, now, app_name],
+                )?;
+                Ok(self.conn.last_insert_rowid())
+            }
         }
     }
 
     pub fn recent(&self, limit: usize) -> Result<Vec<ClipEntry>> {
-        let mut stmt = self.conn.prepare(
+        query_entries(
+            &self.conn,
             "SELECT id, content, hash, timestamp, app_name FROM clips ORDER BY timestamp DESC LIMIT ?1",
-        )?;
-        let entries = stmt
-            .query_map(params![limit as i64], |row| {
-                Ok(ClipEntry {
-                    id: row.get(0)?,
-                    content: row.get(1)?,
-                    hash: row.get(2)?,
-                    timestamp: Local.timestamp_opt(row.get::<_, i64>(3)?, 0).unwrap(),
-                    app_name: row.get(4)?,
-                })
-            })?
-            .collect::<Result<Vec<_>>>()?;
-        Ok(entries)
+            &[&(limit as i64)],
+        )
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<ClipEntry>> {
         let pattern = format!("%{query}%");
-        let mut stmt = self.conn.prepare(
+        query_entries(
+            &self.conn,
             "SELECT id, content, hash, timestamp, app_name FROM clips WHERE content LIKE ?1 ORDER BY timestamp DESC LIMIT ?2",
-        )?;
-        let entries = stmt
-            .query_map(params![pattern, limit as i64], |row| {
-                Ok(ClipEntry {
-                    id: row.get(0)?,
-                    content: row.get(1)?,
-                    hash: row.get(2)?,
-                    timestamp: Local.timestamp_opt(row.get::<_, i64>(3)?, 0).unwrap(),
-                    app_name: row.get(4)?,
-                })
-            })?
-            .collect::<Result<Vec<_>>>()?;
-        Ok(entries)
+            &[&pattern as &dyn rusqlite::types::ToSql, &(limit as i64)],
+        )
     }
 
     pub fn get(&self, id: i64) -> Result<Option<ClipEntry>> {
@@ -108,30 +101,19 @@ impl Store {
             .query_row(
                 "SELECT id, content, hash, timestamp, app_name FROM clips WHERE id = ?1",
                 params![id],
-                |row| {
-                    Ok(ClipEntry {
-                        id: row.get(0)?,
-                        content: row.get(1)?,
-                        hash: row.get(2)?,
-                        timestamp: Local.timestamp_opt(row.get::<_, i64>(3)?, 0).unwrap(),
-                        app_name: row.get(4)?,
-                    })
-                },
+                row_to_entry,
             )
             .optional()
     }
 
     pub fn delete(&self, id: i64) -> Result<bool> {
-        let affected = self
-            .conn
-            .execute("DELETE FROM clips WHERE id = ?1", params![id])?;
-        Ok(affected > 0)
+        self.conn
+            .execute("DELETE FROM clips WHERE id = ?1", params![id])
+            .map(|n| n > 0)
     }
 
     pub fn clear(&self) -> Result<usize> {
-        let count: i64 =
-            self.conn
-                .query_row("SELECT COUNT(*) FROM clips", [], |row| row.get(0))?;
+        let count: i64 = self.conn.query_row("SELECT COUNT(*) FROM clips", [], |row| row.get(0))?;
         self.conn.execute("DELETE FROM clips", [])?;
         Ok(count as usize)
     }
@@ -139,12 +121,6 @@ impl Store {
     pub fn all(&self) -> Result<Vec<ClipEntry>> {
         self.recent(10000)
     }
-}
-
-fn content_hash(content: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(content.as_bytes());
-    hex::encode(hasher.finalize())
 }
 
 trait OptionalExt<T> {
