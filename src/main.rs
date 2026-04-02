@@ -139,12 +139,60 @@ fn cmd_clear() -> Result<String> {
         .map(|count| format!("Cleared {count} entries."))
 }
 
+fn app_bundle_dir() -> std::path::PathBuf {
+    dirs::home_dir().unwrap().join("Applications").join("Rippy.app")
+}
+
+/// Create a minimal macOS .app bundle containing the rippy binary.
+///
+/// Why: macOS Accessibility permissions (required for CGEventTap-based global
+/// hotkeys) only work reliably with .app bundles. Raw binaries launched by
+/// launchd won't appear in System Settings > Privacy & Security > Accessibility,
+/// and AXIsProcessTrustedWithOptions won't show its prompt dialog for them.
+///
+/// Wrapping the binary in a .app bundle (with an Info.plist that declares a
+/// CFBundleIdentifier) lets macOS identify it as a proper app, so:
+///   1. The native Accessibility prompt dialog works
+///   2. "Rippy" appears by name in the Accessibility list
+///   3. The user can toggle permission on without hunting for a raw binary path
+///
+/// The bundle is placed in ~/Applications/Rippy.app and the launchd plist
+/// points to the binary inside it, not the original cargo-installed binary.
+fn create_app_bundle(rippy_bin: &str) -> std::result::Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    let app_dir = app_bundle_dir();
+    let macos_dir = app_dir.join("Contents").join("MacOS");
+    std::fs::create_dir_all(&macos_dir)?;
+
+    let info_plist = app_dir.join("Contents").join("Info.plist");
+    std::fs::write(&info_plist, r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.rippy.watcher</string>
+    <key>CFBundleName</key>
+    <string>Rippy</string>
+    <key>CFBundleExecutable</key>
+    <string>rippy</string>
+</dict>
+</plist>"#)?;
+
+    // Copy the binary into the .app bundle (not symlink — macOS resolves
+    // symlinks and grants permission to the target, defeating the purpose)
+    let dest = macos_dir.join("rippy");
+    std::fs::copy(rippy_bin, &dest)?;
+    Ok(dest)
+}
+
 fn cmd_install() -> Result<String> {
     let plist_path = plist_path();
     let rippy_bin = std::env::current_exe()?
         .canonicalize()?
         .to_string_lossy()
         .to_string();
+
+    let bundle_bin = create_app_bundle(&rippy_bin)?;
+    let bundle_bin_str = bundle_bin.to_string_lossy().to_string();
 
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -155,7 +203,7 @@ fn cmd_install() -> Result<String> {
     <string>com.rippy.watcher</string>
     <key>ProgramArguments</key>
     <array>
-        <string>{rippy_bin}</string>
+        <string>{bundle_bin_str}</string>
         <string>watch</string>
     </array>
     <key>RunAtLoad</key>
@@ -172,13 +220,14 @@ fn cmd_install() -> Result<String> {
         .args(["load", &plist_path.to_string_lossy()])
         .status()?;
 
-    let mut msg = format!("Installed launchd service.\nClipboard is now monitored 24/7, even when rippy isn't open.\nPlist: {}", plist_path.display());
+    let mut msg = format!("Installed launchd service.\nClipboard is now monitored 24/7, even when rippy isn't open.");
+    msg.push_str(&format!("\nApp bundle: {}", app_bundle_dir().display()));
     msg.push_str(&format!(
         "\n\nGlobal hotkey ({}) is active. To change it: rippy hotkey set --key <key> --modifiers <mods>",
         config::format_hotkey(&config::Config::load(&data_dir()).hotkey)
     ));
     msg.push_str("\n\nNote: The hotkey requires Accessibility permission.");
-    msg.push_str("\n  System Settings > Privacy & Security > Accessibility");
+    msg.push_str("\n  Grant it to \"Rippy\" in System Settings > Privacy & Security > Accessibility");
     Ok(msg)
 }
 
@@ -190,10 +239,17 @@ fn cmd_uninstall() -> Result<String> {
             .args(["unload", &plist_path.to_string_lossy()])
             .status()?;
         std::fs::remove_file(&plist_path)?;
-        Ok("Uninstalled launchd service. Clipboard monitoring stopped.".to_string())
     } else {
-        Ok("No launchd service installed.".to_string())
+        return Ok("No launchd service installed.".to_string());
     }
+
+    // Remove the .app bundle
+    let app_dir = app_bundle_dir();
+    if app_dir.exists() {
+        std::fs::remove_dir_all(&app_dir)?;
+    }
+
+    Ok("Uninstalled launchd service and removed Rippy.app bundle.".to_string())
 }
 
 fn cmd_hotkey(action: HotkeyAction) -> Result {
@@ -233,9 +289,8 @@ fn cmd_hotkey(action: HotkeyAction) -> Result {
         }
         HotkeyAction::Test => {
             let cfg = config::Config::load(&dir);
-            if !hotkey::check_accessibility() {
-                eprintln!("Warning: Accessibility permission not granted.");
-                eprintln!("  System Settings > Privacy & Security > Accessibility");
+            if !hotkey::check_accessibility(true) {
+                eprintln!("Warning: Accessibility permission not granted. A system dialog should appear.");
                 eprintln!();
             }
             println!("Listening for {}... Press Ctrl+C to stop.", config::format_hotkey(&cfg.hotkey));
@@ -260,9 +315,8 @@ fn cmd_watch() -> Result {
     let w = watcher::Watcher::spawn(&db_path());
     let cfg = config::Config::load(&data_dir());
 
-    if !hotkey::check_accessibility() {
-        eprintln!("Hotkey disabled: Accessibility permission not granted.");
-        eprintln!("  System Settings > Privacy & Security > Accessibility");
+    if !hotkey::check_accessibility(true) {
+        eprintln!("Hotkey disabled: Accessibility permission not granted. A system dialog should appear.");
         eprintln!("Falling back to clipboard watching only.");
         while running.load(Ordering::Relaxed) {
             std::thread::sleep(std::time::Duration::from_secs(1));

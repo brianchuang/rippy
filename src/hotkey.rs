@@ -12,6 +12,8 @@ type CFRunLoopRef = *mut c_void;
 type CFAllocatorRef = *const c_void;
 type CFIndex = isize;
 type CFStringRef = *const c_void;
+type CFDictionaryRef = *const c_void;
+type CFBooleanRef = *const c_void;
 
 // Core Graphics types
 type CGEventRef = *mut c_void;
@@ -48,12 +50,27 @@ extern "C" {
 
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
-    fn AXIsProcessTrusted() -> bool;
+    fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> bool;
+}
+
+// kAXTrustedCheckOptionPrompt key from HIServices
+extern "C" {
+    static kAXTrustedCheckOptionPrompt: CFStringRef;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     static kCFRunLoopCommonModes: CFStringRef;
+    static kCFBooleanTrue: CFBooleanRef;
+    fn CFDictionaryCreate(
+        allocator: CFAllocatorRef,
+        keys: *const *const c_void,
+        values: *const *const c_void,
+        num_values: CFIndex,
+        key_callbacks: *const c_void,
+        value_callbacks: *const c_void,
+    ) -> CFDictionaryRef;
+    fn CFRelease(cf: *const c_void);
     fn CFMachPortCreateRunLoopSource(
         allocator: CFAllocatorRef,
         port: CFMachPortRef,
@@ -66,8 +83,32 @@ extern "C" {
 }
 
 /// Check if the process has Accessibility permissions.
-pub fn check_accessibility() -> bool {
-    unsafe { AXIsProcessTrusted() }
+///
+/// We use `AXIsProcessTrustedWithOptions` instead of the simpler `AXIsProcessTrusted`
+/// because when called with `kAXTrustedCheckOptionPrompt: true`, macOS shows its
+/// native permission dialog and adds the calling binary to the Accessibility list.
+/// This only works when the binary lives inside a .app bundle (see `create_app_bundle`
+/// in main.rs) — raw binaries are silently ignored by the prompt.
+pub fn check_accessibility(prompt: bool) -> bool {
+    unsafe {
+        if !prompt {
+            let opts = std::ptr::null();
+            return AXIsProcessTrustedWithOptions(opts);
+        }
+        let keys = [kAXTrustedCheckOptionPrompt as *const c_void];
+        let values = [kCFBooleanTrue as *const c_void];
+        let dict = CFDictionaryCreate(
+            std::ptr::null(),
+            keys.as_ptr(),
+            values.as_ptr(),
+            1,
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+        let trusted = AXIsProcessTrustedWithOptions(dict);
+        CFRelease(dict as *const c_void);
+        trusted
+    }
 }
 
 struct HotkeyContext {
@@ -135,8 +176,8 @@ pub fn install_and_run(cfg: &Config, running: Arc<AtomicBool>) {
         );
 
         if tap.is_null() {
-            eprintln!("Failed to create event tap. Make sure Accessibility is enabled:");
-            eprintln!("  System Settings > Privacy & Security > Accessibility");
+            eprintln!("Failed to create event tap. Requesting Accessibility permission...");
+            check_accessibility(true);
             // Clean up
             let _ = Box::from_raw(ctx_ptr as *mut HotkeyContext);
             return;
